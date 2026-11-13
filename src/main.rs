@@ -34,7 +34,7 @@ fn load_rows(directory: &Path, show_hidden: bool) -> Result<Vec<Line<'static>>, 
     let mut command = Command::new("eza");
     command
         .current_dir(directory)
-        .args(["--classify", "-l", "--color=always"]);
+        .args(["--classify=always", "-l", "--color=always"]);
     if show_hidden {
         command.arg("-a");
     }
@@ -106,8 +106,8 @@ fn entry_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf
 fn listing_height(row_count: usize) -> io::Result<u16> {
     let (_, terminal_height) = size()?;
     Ok(row_count
-        .saturating_add(1)
-        .min(terminal_height.saturating_sub(1).max(2) as usize) as u16)
+        .saturating_add(2)
+        .min(terminal_height.saturating_sub(1).max(3) as usize) as u16)
 }
 
 fn resize_listing(
@@ -148,8 +148,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         terminal.draw(|frame| {
-            let [listing, hints] =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+            let [listing, hints, cwd] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(frame.area());
             let list = List::new(rows.iter().cloned())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD));
             frame.render_stateful_widget(list, listing, &mut selection);
@@ -159,6 +163,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 )
                 .style(Style::default().fg(Color::DarkGray)),
                 hints,
+            );
+            frame.render_widget(
+                Paragraph::new(directory.to_string_lossy()).style(Style::default().fg(Color::Cyan)),
+                cwd,
             );
         })?;
 
@@ -253,17 +261,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Erase only the hint row, leaving the listing intact above the prompt.
+    // Erase the footer, leaving the listing intact above the prompt.
     terminal.draw(|frame| {
         let area = frame.area();
-        let [listing, hints] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-        let list = List::new(rows.iter().cloned())
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+        let [listing, footer] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(area);
+        let list = List::new(rows.iter().cloned());
         frame.render_stateful_widget(list, listing, &mut selection);
-        frame.render_widget(Clear, hints);
+        frame.render_widget(Clear, footer);
     })?;
-    let bottom = terminal.get_frame().area().bottom().saturating_sub(1);
+    let bottom = terminal.get_frame().area().bottom().saturating_sub(2);
     terminal.set_cursor_position((0, bottom))?;
     execute!(terminal.backend_mut(), MoveToColumn(0))?;
     if let Some(file) = std::env::var_os("LS_INTERACTIVE_CWD_FILE") {
