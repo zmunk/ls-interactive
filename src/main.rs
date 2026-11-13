@@ -1,8 +1,9 @@
 use std::{
     error::Error,
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use ansi_to_tui::IntoText;
@@ -16,7 +17,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Clear, List, ListState, Paragraph},
     Terminal, TerminalOptions, Viewport,
 };
@@ -30,13 +31,24 @@ impl Drop for RestoreTerminal {
     }
 }
 
-fn load_rows(directory: &Path, show_hidden: bool) -> Result<Vec<Line<'static>>, Box<dyn Error>> {
+fn load_rows(
+    directory: &Path,
+    show_hidden: bool,
+    sort_modified: bool,
+) -> Result<Vec<Line<'static>>, Box<dyn Error>> {
     let mut command = Command::new("eza");
-    command
-        .current_dir(directory)
-        .args(["--classify=always", "-l", "--color=always"]);
+    command.current_dir(directory).args([
+        "--classify=always",
+        "-l",
+        "--color=always",
+        "--no-permissions",
+        "--no-user",
+    ]);
     if show_hidden {
         command.arg("-a");
+    }
+    if sort_modified {
+        command.args(["--sort=modified", "--reverse"]);
     }
     let output = command.output()?;
     if !output.status.success() {
@@ -47,7 +59,24 @@ fn load_rows(directory: &Path, show_hidden: bool) -> Result<Vec<Line<'static>>, 
         ))
         .into());
     }
-    Ok(output.stdout.into_text()?.lines)
+    let mut rows = output.stdout.into_text()?.lines;
+    for row in &mut rows {
+        if directory_for_row(directory, row)?.is_some() {
+            for span in &mut row.spans {
+                if let Some((index, ch)) = span
+                    .content
+                    .char_indices()
+                    .find(|(_, ch)| !ch.is_whitespace())
+                {
+                    if ch == '-' {
+                        span.content.to_mut().replace_range(index..index + 1, " ");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn directory_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf>> {
@@ -103,6 +132,35 @@ fn entry_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf
         .map(|(_, path)| path))
 }
 
+fn copy_filename(path: &Path) -> io::Result<()> {
+    const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let Some(name) = path.file_name() else {
+        return Ok(());
+    };
+    let name = name.to_string_lossy();
+    let mut encoded = String::new();
+    for chunk in name.as_bytes().chunks(3) {
+        let bits = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+            | chunk.get(2).copied().unwrap_or(0) as u32;
+        encoded.push(BASE64[((bits >> 18) & 63) as usize] as char);
+        encoded.push(BASE64[((bits >> 12) & 63) as usize] as char);
+        encoded.push(if chunk.len() > 1 {
+            BASE64[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            BASE64[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
+}
+
 fn listing_height(row_count: usize) -> io::Result<u16> {
     let (_, terminal_height) = size()?;
     Ok(row_count
@@ -130,7 +188,8 @@ fn resize_listing(
 fn main() -> Result<(), Box<dyn Error>> {
     let mut directory = std::env::current_dir()?;
     let mut show_hidden = true;
-    let mut rows = load_rows(&directory, show_hidden)?;
+    let mut sort_modified = false;
+    let mut rows = load_rows(&directory, show_hidden, sort_modified)?;
 
     // An inline viewport uses the normal screen, not the alternate screen.
     // Long listings scroll inside the viewport as the selection moves.
@@ -145,8 +204,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _restore = RestoreTerminal;
     terminal.hide_cursor()?;
     let mut selection = ListState::default().with_selected((!rows.is_empty()).then_some(0));
+    let mut pending_g = false;
+    let mut show_hints = false;
+    let mut copied: Option<(String, Instant)> = None;
 
     loop {
+        if copied
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() >= *until)
+        {
+            copied = None;
+        }
         terminal.draw(|frame| {
             let [listing, hints, cwd] = Layout::vertical([
                 Constraint::Min(1),
@@ -157,35 +225,77 @@ fn main() -> Result<(), Box<dyn Error>> {
             let list = List::new(rows.iter().cloned())
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD));
             frame.render_stateful_widget(list, listing, &mut selection);
-            frame.render_widget(
-                Paragraph::new(
-                    "j/k: move  Enter: open  Bksp: parent  .: hidden  e: nvim  q/Ctrl-C: quit",
-                )
-                .style(Style::default().fg(Color::DarkGray)),
-                hints,
-            );
+            let hint_text = if show_hints {
+                "gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y: copy name  e: nvim  q/Ctrl-C: quit  ?: hide hints"
+            } else {
+                "?: hints"
+            };
+            let mut footer = vec![Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            )];
+            if let Some((text, _)) = &copied {
+                footer.push(Span::styled(
+                    format!("  copied: {text}"),
+                    Style::default().fg(Color::White),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(footer)), hints);
             frame.render_widget(
                 Paragraph::new(directory.to_string_lossy()).style(Style::default().fg(Color::Cyan)),
                 cwd,
             );
         })?;
 
+        if let Some((_, until)) = &copied {
+            if !event::poll(until.saturating_duration_since(Instant::now()))? {
+                continue;
+            }
+        }
         if let Event::Key(key) = event::read()? {
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 continue;
             }
             let current = selection.selected().unwrap_or(0);
+            if key.code == KeyCode::Char('g') {
+                if pending_g {
+                    selection.select((!rows.is_empty()).then_some(0));
+                }
+                pending_g = !pending_g;
+                continue;
+            }
+            pending_g = false;
             match key.code {
+                KeyCode::Char('?') => show_hints = !show_hints,
+                KeyCode::Char('G') => {
+                    selection.select(rows.len().checked_sub(1));
+                }
+                KeyCode::Char('u') | KeyCode::Char('d')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && !rows.is_empty() =>
+                {
+                    let step =
+                        (terminal.get_frame().area().height.saturating_sub(2) as usize / 2).max(1);
+                    let next = if key.code == KeyCode::Char('u') {
+                        current.saturating_sub(step)
+                    } else {
+                        current.saturating_add(step).min(rows.len() - 1)
+                    };
+                    selection.select(Some(next));
+                }
                 KeyCode::Char('q') => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char('.') => {
+                KeyCode::Char('.') | KeyCode::Char('m') => {
                     let previous = rows
                         .get(current)
                         .map(|line| entry_for_row(&directory, line))
                         .transpose()?
                         .flatten();
-                    show_hidden = !show_hidden;
-                    rows = load_rows(&directory, show_hidden)?;
+                    if key.code == KeyCode::Char('.') {
+                        show_hidden = !show_hidden;
+                    } else {
+                        sort_modified = !sort_modified;
+                    }
+                    rows = load_rows(&directory, show_hidden, sort_modified)?;
                     let selected = previous.and_then(|path| {
                         rows.iter().position(|line| {
                             entry_for_row(&directory, line).ok().flatten().as_ref() == Some(&path)
@@ -194,6 +304,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     selection = ListState::default()
                         .with_selected(selected.or_else(|| (!rows.is_empty()).then_some(0)));
                     resize_listing(&mut terminal, rows.len())?;
+                }
+                KeyCode::Char('y') => {
+                    if let Some(line) = rows.get(current) {
+                        if let Some(path) = entry_for_row(&directory, line)? {
+                            copy_filename(&path)?;
+                            if let Some(name) = path.file_name() {
+                                copied = Some((
+                                    name.to_string_lossy().into_owned(),
+                                    Instant::now() + Duration::from_secs(1),
+                                ));
+                            }
+                        }
+                    }
                 }
                 KeyCode::Char('e') => {
                     if let Some(line) = rows.get(current) {
@@ -209,7 +332,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             enable_raw_mode()?;
                             terminal.hide_cursor()?;
                             result?;
-                            rows = load_rows(&directory, show_hidden)?;
+                            rows = load_rows(&directory, show_hidden, sort_modified)?;
                             let selected = rows.iter().position(|line| {
                                 entry_for_row(&directory, line).ok().flatten().as_ref()
                                     == Some(&path)
@@ -231,7 +354,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         None
                     };
                     if let Some(destination) = destination {
-                        let next_rows = load_rows(&destination, show_hidden)?;
+                        let next_rows = load_rows(&destination, show_hidden, sort_modified)?;
                         let selected = if going_up {
                             next_rows.iter().position(|line| {
                                 directory_for_row(&destination, line)
