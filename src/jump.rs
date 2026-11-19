@@ -4,7 +4,7 @@ use std::{
 };
 
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
 };
 
@@ -47,7 +47,12 @@ impl JumpMode {
         self.targets.get(&hint_key(ch)).copied()
     }
 
-    pub(super) fn render_line(&self, index: usize, line: &Line<'static>) -> Line<'static> {
+    pub(super) fn render_line(
+        &self,
+        index: usize,
+        line: &Line<'static>,
+        hint_style: Style,
+    ) -> Line<'static> {
         let Some(range) = self.highlights.get(&index) else {
             return line.clone();
         };
@@ -62,15 +67,9 @@ impl JumpMode {
                     line.spans
                         .push(Span::styled(span.content[..start].to_owned(), span.style));
                 }
-                let hint_style = span.style.patch(
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                );
                 line.spans.push(Span::styled(
                     span.content[start..end].to_owned(),
-                    hint_style,
+                    span.style.patch(hint_style),
                 ));
                 if end < span.content.len() {
                     line.spans
@@ -146,6 +145,7 @@ fn assign<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     fn row(name: &str) -> Row {
         Row {
@@ -180,9 +180,11 @@ mod tests {
     fn highlights_only_the_assigned_letter_without_changing_text() {
         let rows = [row("ab"), row("a")];
         let jump = JumpMode::new(&rows, 0..2, 80).unwrap();
-        let rendered = jump.render_line(0, &rows[0].line);
+        let style = Style::default().fg(Color::White).bg(Color::Blue);
+        let rendered = jump.render_line(0, &rows[0].line, style);
         assert_eq!(row_text(&rendered), row_text(&rows[0].line));
         assert_eq!(rendered.spans[1].content.as_ref(), "b");
-        assert_eq!(rendered.spans[1].style.bg, Some(Color::Yellow));
+        assert_eq!(rendered.spans[1].style, style);
+        assert_eq!(rendered.spans[0].style, Style::default());
     }
 }

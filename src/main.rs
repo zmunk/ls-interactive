@@ -1,5 +1,6 @@
 use std::{
     error::Error,
+    ffi::OsString,
     io::{self, Write},
     ops::Range,
     path::{Path, PathBuf},
@@ -23,8 +24,10 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
 };
 
+mod config;
 mod jump;
 
+use config::Config;
 use jump::JumpMode;
 
 struct Row {
@@ -45,6 +48,7 @@ fn load_rows(
     directory: &Path,
     show_hidden: bool,
     sort_modified: bool,
+    eza_args: &[OsString],
 ) -> Result<Vec<Row>, Box<dyn Error>> {
     let mut command = Command::new("eza");
     command.current_dir(directory).args([
@@ -54,6 +58,7 @@ fn load_rows(
         "--no-permissions",
         "--no-user",
     ]);
+    command.args(eza_args);
     if show_hidden {
         command.arg("-a");
     }
@@ -228,10 +233,12 @@ fn resize_listing(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let config = Config::load()?;
     let mut directory = std::env::current_dir()?;
     let mut show_hidden = true;
     let mut sort_modified = false;
-    let mut rows = load_rows(&directory, show_hidden, sort_modified)?;
+    let eza_args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut rows = load_rows(&directory, show_hidden, sort_modified, &eza_args)?;
 
     // An inline viewport uses the normal screen, not the alternate screen.
     // Long listings scroll inside the viewport as the selection moves.
@@ -270,7 +277,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let list = List::new(rows.iter().enumerate().map(|(index, row)| {
                 jump.as_ref().map_or_else(
                     || row.line.clone(),
-                    |jump| jump.render_line(index, &row.line),
+                    |jump| jump.render_line(index, &row.line, config.jump_hint_style),
                 )
             }))
             .highlight_style(Style::default().add_modifier(Modifier::BOLD));
@@ -281,7 +288,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let hint_text = if jump.is_some() {
                 "Jump: type a highlighted letter  Esc: cancel"
             } else if show_hints {
-                "/: jump  gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y/Y: copy name/path  e: nvim  q/Ctrl-C: quit  ?: hide hints"
+                "/: jump  gg: first  G: last  Enter: cd/nvim  Bksp: parent  .: hidden  m: modified/name  y/Y: copy name/path  e: nvim  q/Esc/Ctrl-C: quit  ?: hide hints"
             } else {
                 "/: jump  ?: hints"
             };
@@ -359,6 +366,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     selection.select(Some(next));
                 }
                 KeyCode::Char('q') => break,
+                KeyCode::Esc if key.kind == KeyEventKind::Press => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                 KeyCode::Char('.') | KeyCode::Char('m') => {
                     let previous = rows
@@ -371,7 +379,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         sort_modified = !sort_modified;
                     }
-                    rows = load_rows(&directory, show_hidden, sort_modified)?;
+                    rows = load_rows(&directory, show_hidden, sort_modified, &eza_args)?;
                     let selected = previous.and_then(|path| {
                         rows.iter().position(|row| {
                             entry_for_row(&directory, &row.line).ok().flatten().as_ref()
@@ -391,44 +399,44 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                KeyCode::Char('e') => {
-                    if let Some(row) = rows.get(current) {
-                        if let Some(path) =
-                            entry_for_row(&directory, &row.line)?.filter(|p| p.is_file())
-                        {
-                            disable_raw_mode()?;
-                            terminal.show_cursor()?;
-                            let result = Command::new("nvim")
-                                .current_dir(&directory)
-                                .arg("--")
-                                .arg(&path)
-                                .status();
-                            enable_raw_mode()?;
-                            terminal.hide_cursor()?;
-                            result?;
-                            rows = load_rows(&directory, show_hidden, sort_modified)?;
-                            let selected = rows.iter().position(|row| {
-                                entry_for_row(&directory, &row.line).ok().flatten().as_ref()
-                                    == Some(&path)
-                            });
-                            selection = ListState::default().with_selected(
-                                selected.or_else(|| (!rows.is_empty()).then_some(0)),
-                            );
-                            resize_listing(&mut terminal, rows.len())?;
-                        }
-                    }
-                }
-                KeyCode::Backspace | KeyCode::Enter => {
+                KeyCode::Char('e') | KeyCode::Enter | KeyCode::Backspace => {
                     let going_up = key.code == KeyCode::Backspace;
-                    let destination = if going_up {
-                        directory.parent().map(Path::to_path_buf)
+                    let entry = if going_up {
+                        None
                     } else if let Some(row) = rows.get(current) {
-                        directory_for_row(&directory, &row.line)?
+                        entry_for_row(&directory, &row.line)?
                     } else {
                         None
                     };
+                    if let Some(path) = entry.as_ref().filter(|path| path.is_file()) {
+                        disable_raw_mode()?;
+                        terminal.show_cursor()?;
+                        let result = Command::new("nvim")
+                            .current_dir(&directory)
+                            .arg("--")
+                            .arg(path)
+                            .status();
+                        enable_raw_mode()?;
+                        terminal.hide_cursor()?;
+                        result?;
+                        rows = load_rows(&directory, show_hidden, sort_modified, &eza_args)?;
+                        let selected = rows.iter().position(|row| {
+                            entry_for_row(&directory, &row.line).ok().flatten().as_ref()
+                                == Some(path)
+                        });
+                        selection = ListState::default()
+                            .with_selected(selected.or_else(|| (!rows.is_empty()).then_some(0)));
+                        resize_listing(&mut terminal, rows.len())?;
+                        continue;
+                    }
+                    let destination = match key.code {
+                        KeyCode::Backspace => directory.parent().map(Path::to_path_buf),
+                        KeyCode::Enter => entry.filter(|path| path.is_dir()),
+                        _ => None,
+                    };
                     if let Some(destination) = destination {
-                        let next_rows = load_rows(&destination, show_hidden, sort_modified)?;
+                        let next_rows =
+                            load_rows(&destination, show_hidden, sort_modified, &eza_args)?;
                         let selected = if going_up {
                             next_rows.iter().position(|row| {
                                 directory_for_row(&destination, &row.line)

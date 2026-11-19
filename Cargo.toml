@@ -7,3 +7,4 @@ edition = "2021"
 ansi-to-tui = "7"
 crossterm = "0.28"
 ratatui = "0.29"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
