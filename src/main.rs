@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     io::{self, Write},
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -22,6 +23,15 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
 };
 
+mod jump;
+
+use jump::JumpMode;
+
+struct Row {
+    line: Line<'static>,
+    name: Option<Range<usize>>,
+}
+
 struct RestoreTerminal;
 
 impl Drop for RestoreTerminal {
@@ -35,7 +45,7 @@ fn load_rows(
     directory: &Path,
     show_hidden: bool,
     sort_modified: bool,
-) -> Result<Vec<Line<'static>>, Box<dyn Error>> {
+) -> Result<Vec<Row>, Box<dyn Error>> {
     let mut command = Command::new("eza");
     command.current_dir(directory).args([
         "--classify=always",
@@ -59,10 +69,11 @@ fn load_rows(
         ))
         .into());
     }
-    let mut rows = output.stdout.into_text()?.lines;
-    for row in &mut rows {
-        if directory_for_row(directory, row)?.is_some() {
-            for span in &mut row.spans {
+    let mut rows = Vec::new();
+    for mut line in output.stdout.into_text()?.lines {
+        let entry = entry_and_name_for_row(directory, &row_text(&line))?;
+        if entry.as_ref().is_some_and(|(path, _)| path.is_dir()) {
+            for span in &mut line.spans {
                 if let Some((index, ch)) = span
                     .content
                     .char_indices()
@@ -75,6 +86,10 @@ fn load_rows(
                 }
             }
         }
+        rows.push(Row {
+            line,
+            name: entry.map(|(_, name)| name),
+        });
     }
     Ok(rows)
 }
@@ -84,12 +99,21 @@ fn directory_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<Pat
 }
 
 fn entry_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf>> {
-    let text: String = line
-        .spans
+    Ok(entry_and_name_for_row(directory, &row_text(line))?.map(|(path, _)| path))
+}
+
+fn row_text(line: &Line<'_>) -> String {
+    line.spans
         .iter()
         .map(|span| span.content.as_ref())
-        .collect();
-    let mut matches = Vec::new();
+        .collect()
+}
+
+fn entry_and_name_for_row(
+    directory: &Path,
+    text: &str,
+) -> io::Result<Option<(PathBuf, Range<usize>)>> {
+    let mut best: Option<(PathBuf, Range<usize>)> = None;
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -97,39 +121,52 @@ fn entry_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf
             text.split_once(" -> ")
                 .or_else(|| text.split_once(" ⇒ "))
                 .or_else(|| text.split_once(" → "))
-                .map_or(text.as_str(), |(name, _)| name)
+                .map_or(text, |(name, _)| name)
         } else {
-            text.as_str()
+            text
         };
-        let matched = [
-            name.clone(),
-            format!("'{name}'"),
-            format!("\"{name}\""),
-            format!("{name}/"),
-            format!("'{name}'/"),
-            format!("\"{name}\"/"),
-            format!("{name}@"),
-            format!("'{name}'@"),
-            format!("\"{name}\"@"),
-            format!("{name}*"),
-            format!("'{name}'*"),
-            format!("\"{name}\"*"),
-        ]
-        .iter()
-        .any(|suffix| {
-            displayed
-                .strip_suffix(suffix.as_str())
-                .is_some_and(|prefix| prefix.ends_with(char::is_whitespace))
-        });
-        if matched {
-            matches.push((name.len(), entry.path()));
+        // Prefer the whole name over a suffix shared by another entry.
+        if best
+            .as_ref()
+            .is_some_and(|(_, range)| range.len() > name.len())
+        {
+            continue;
+        }
+        if let Some(range) = displayed_name_range(displayed, &name) {
+            best = Some((entry.path(), range));
         }
     }
-    // Prefer the whole name over a suffix shared by another directory.
-    Ok(matches
-        .into_iter()
-        .max_by_key(|(length, _)| *length)
-        .map(|(_, path)| path))
+    Ok(best)
+}
+
+fn displayed_name_range(displayed: &str, name: &str) -> Option<Range<usize>> {
+    for marker in ["", "/", "@", "*"] {
+        let Some(stem) = displayed.strip_suffix(marker) else {
+            continue;
+        };
+        for quote in ["", "'", "\""] {
+            let Some(prefix) = stem
+                .strip_suffix(quote)
+                .and_then(|stem| stem.strip_suffix(name))
+                .and_then(|stem| stem.strip_suffix(quote))
+            else {
+                continue;
+            };
+            if prefix.ends_with(char::is_whitespace) {
+                let start = prefix.len() + quote.len();
+                return Some(start..start + name.len());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn filename_range_excludes_metadata_quotes_and_classification_markers() {
+    let displayed = "meta 'some dir'/";
+    let range = displayed_name_range(displayed, "some dir").unwrap();
+    assert_eq!(&displayed[range], "some dir");
+    assert!(displayed_name_range(displayed, "dir").is_none());
 }
 
 fn copy_path(path: &Path, absolute: bool) -> io::Result<Option<String>> {
@@ -211,6 +248,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut selection = ListState::default().with_selected((!rows.is_empty()).then_some(0));
     let mut pending_g = false;
     let mut show_hints = false;
+    let mut jump: Option<JumpMode> = None;
     let mut copied: Option<(String, Instant)> = None;
 
     loop {
@@ -220,6 +258,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             copied = None;
         }
+        let mut visible = 0..0;
+        let mut listing_width = 0;
         terminal.draw(|frame| {
             let [listing, hints, cwd] = Layout::vertical([
                 Constraint::Min(1),
@@ -227,13 +267,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Constraint::Length(1),
             ])
             .areas(frame.area());
-            let list = List::new(rows.iter().cloned())
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+            let list = List::new(rows.iter().enumerate().map(|(index, row)| {
+                jump.as_ref().map_or_else(
+                    || row.line.clone(),
+                    |jump| jump.render_line(index, &row.line),
+                )
+            }))
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD));
             frame.render_stateful_widget(list, listing, &mut selection);
-            let hint_text = if show_hints {
-                "gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y/Y: copy name/path  e: nvim  q/Ctrl-C: quit  ?: hide hints"
+            let start = selection.offset().min(rows.len());
+            visible = start..(start + usize::from(listing.height)).min(rows.len());
+            listing_width = usize::from(listing.width);
+            let hint_text = if jump.is_some() {
+                "Jump: type a highlighted letter  Esc: cancel"
+            } else if show_hints {
+                "/: jump  gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y/Y: copy name/path  e: nvim  q/Ctrl-C: quit  ?: hide hints"
             } else {
-                "?: hints"
+                "/: jump  ?: hints"
             };
             let mut footer = vec![Span::styled(
                 hint_text,
@@ -257,8 +307,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
         }
-        if let Event::Key(key) = event::read()? {
+        let event = event::read()?;
+        if matches!(event, Event::Resize(..)) {
+            jump = None;
+            continue;
+        }
+        if let Event::Key(key) = event {
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            if let Some(active) = &jump {
+                match key.code {
+                    KeyCode::Esc => jump = None,
+                    KeyCode::Char(ch) if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
+                        if let Some(row) = active.target(ch) {
+                            selection.select(Some(row));
+                            jump = None;
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             let current = selection.selected().unwrap_or(0);
@@ -271,6 +339,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             pending_g = false;
             match key.code {
+                KeyCode::Char('/') if key.kind == KeyEventKind::Press => {
+                    jump = JumpMode::new(&rows, visible, listing_width);
+                }
                 KeyCode::Char('?') => show_hints = !show_hints,
                 KeyCode::Char('G') => {
                     selection.select(rows.len().checked_sub(1));
@@ -292,7 +363,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 KeyCode::Char('.') | KeyCode::Char('m') => {
                     let previous = rows
                         .get(current)
-                        .map(|line| entry_for_row(&directory, line))
+                        .map(|row| entry_for_row(&directory, &row.line))
                         .transpose()?
                         .flatten();
                     if key.code == KeyCode::Char('.') {
@@ -302,8 +373,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                     rows = load_rows(&directory, show_hidden, sort_modified)?;
                     let selected = previous.and_then(|path| {
-                        rows.iter().position(|line| {
-                            entry_for_row(&directory, line).ok().flatten().as_ref() == Some(&path)
+                        rows.iter().position(|row| {
+                            entry_for_row(&directory, &row.line).ok().flatten().as_ref()
+                                == Some(&path)
                         })
                     });
                     selection = ListState::default()
@@ -311,8 +383,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     resize_listing(&mut terminal, rows.len())?;
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(line) = rows.get(current) {
-                        if let Some(path) = entry_for_row(&directory, line)? {
+                    if let Some(row) = rows.get(current) {
+                        if let Some(path) = entry_for_row(&directory, &row.line)? {
                             if let Some(text) = copy_path(&path, key.code == KeyCode::Char('Y'))? {
                                 copied = Some((text, Instant::now() + Duration::from_secs(1)));
                             }
@@ -320,8 +392,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 KeyCode::Char('e') => {
-                    if let Some(line) = rows.get(current) {
-                        if let Some(path) = entry_for_row(&directory, line)?.filter(|p| p.is_file())
+                    if let Some(row) = rows.get(current) {
+                        if let Some(path) =
+                            entry_for_row(&directory, &row.line)?.filter(|p| p.is_file())
                         {
                             disable_raw_mode()?;
                             terminal.show_cursor()?;
@@ -334,8 +407,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             terminal.hide_cursor()?;
                             result?;
                             rows = load_rows(&directory, show_hidden, sort_modified)?;
-                            let selected = rows.iter().position(|line| {
-                                entry_for_row(&directory, line).ok().flatten().as_ref()
+                            let selected = rows.iter().position(|row| {
+                                entry_for_row(&directory, &row.line).ok().flatten().as_ref()
                                     == Some(&path)
                             });
                             selection = ListState::default().with_selected(
@@ -349,16 +422,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                     let going_up = key.code == KeyCode::Backspace;
                     let destination = if going_up {
                         directory.parent().map(Path::to_path_buf)
-                    } else if let Some(line) = rows.get(current) {
-                        directory_for_row(&directory, line)?
+                    } else if let Some(row) = rows.get(current) {
+                        directory_for_row(&directory, &row.line)?
                     } else {
                         None
                     };
                     if let Some(destination) = destination {
                         let next_rows = load_rows(&destination, show_hidden, sort_modified)?;
                         let selected = if going_up {
-                            next_rows.iter().position(|line| {
-                                directory_for_row(&destination, line)
+                            next_rows.iter().position(|row| {
+                                directory_for_row(&destination, &row.line)
                                     .ok()
                                     .flatten()
                                     .as_ref()
@@ -390,7 +463,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let area = frame.area();
         let [listing, footer] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(area);
-        let list = List::new(rows.iter().cloned());
+        let list = List::new(rows.iter().map(|row| row.line.clone()));
         frame.render_stateful_widget(list, listing, &mut selection);
         frame.render_widget(Clear, footer);
     })?;
