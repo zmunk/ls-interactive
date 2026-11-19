@@ -132,12 +132,16 @@ fn entry_for_row(directory: &Path, line: &Line<'_>) -> io::Result<Option<PathBuf
         .map(|(_, path)| path))
 }
 
-fn copy_filename(path: &Path) -> io::Result<()> {
+fn copy_path(path: &Path, absolute: bool) -> io::Result<Option<String>> {
     const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let Some(name) = path.file_name() else {
-        return Ok(());
+    let text = if absolute {
+        path.as_os_str()
+    } else if let Some(name) = path.file_name() {
+        name
+    } else {
+        return Ok(None);
     };
-    let name = name.to_string_lossy();
+    let name = text.to_string_lossy();
     let mut encoded = String::new();
     for chunk in name.as_bytes().chunks(3) {
         let bits = ((chunk[0] as u32) << 16)
@@ -158,7 +162,8 @@ fn copy_filename(path: &Path) -> io::Result<()> {
     }
     let mut stdout = io::stdout().lock();
     write!(stdout, "\x1b]52;c;{encoded}\x07")?;
-    stdout.flush()
+    stdout.flush()?;
+    Ok(Some(name.into_owned()))
 }
 
 fn listing_height(row_count: usize) -> io::Result<u16> {
@@ -226,7 +231,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .highlight_style(Style::default().add_modifier(Modifier::BOLD));
             frame.render_stateful_widget(list, listing, &mut selection);
             let hint_text = if show_hints {
-                "gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y: copy name  e: nvim  q/Ctrl-C: quit  ?: hide hints"
+                "gg: first  G: last  Enter: open  Bksp: parent  .: hidden  m: modified/name  y/Y: copy name/path  e: nvim  q/Ctrl-C: quit  ?: hide hints"
             } else {
                 "?: hints"
             };
@@ -305,15 +310,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .with_selected(selected.or_else(|| (!rows.is_empty()).then_some(0)));
                     resize_listing(&mut terminal, rows.len())?;
                 }
-                KeyCode::Char('y') => {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(line) = rows.get(current) {
                         if let Some(path) = entry_for_row(&directory, line)? {
-                            copy_filename(&path)?;
-                            if let Some(name) = path.file_name() {
-                                copied = Some((
-                                    name.to_string_lossy().into_owned(),
-                                    Instant::now() + Duration::from_secs(1),
-                                ));
+                            if let Some(text) = copy_path(&path, key.code == KeyCode::Char('Y'))? {
+                                copied = Some((text, Instant::now() + Duration::from_secs(1)));
                             }
                         }
                     }
