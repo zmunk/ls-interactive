@@ -2,13 +2,13 @@
 
 ## Extra `eza` flags
 
-Command-line arguments are passed directly to `eza` on every listing refresh. For example:
+By default, `ls-interactive` runs plain `eza`. Press `.` to toggle hidden entries and `m` to toggle sorting by modification time. Extra command-line arguments are passed directly to `eza` on every listing refresh. For example:
 
 ```sh
 ls-interactive --group-directories-first --ignore-glob '*.tmp'
 ```
 
-Use flags that preserve the long, one-entry-per-line output. Avoid layout modes such as `--tree` and path operands; the app manages which directory is listed.
+Use flags that preserve one entry per line. Pass `-l --color=always` if you want details and colors. Avoid layout modes such as `--tree` and path operands; the app manages which directory is listed.
 
 ## Configuration
 

@@ -51,14 +51,7 @@ fn load_rows(
     eza_args: &[OsString],
 ) -> Result<Vec<Row>, Box<dyn Error>> {
     let mut command = Command::new("eza");
-    command.current_dir(directory).args([
-        "--classify=always",
-        "-l",
-        "--color=always",
-        "--no-permissions",
-        "--no-user",
-    ]);
-    command.args(eza_args);
+    command.current_dir(directory).args(eza_args);
     if show_hidden {
         command.arg("-a");
     }
@@ -77,7 +70,10 @@ fn load_rows(
     let mut rows = Vec::new();
     for mut line in output.stdout.into_text()?.lines {
         let entry = entry_and_name_for_row(directory, &row_text(&line))?;
-        if entry.as_ref().is_some_and(|(path, _)| path.is_dir()) {
+        if entry
+            .as_ref()
+            .is_some_and(|(path, name)| name.start > 0 && path.is_dir())
+        {
             for span in &mut line.spans {
                 if let Some((index, ch)) = span
                     .content
@@ -157,7 +153,7 @@ fn displayed_name_range(displayed: &str, name: &str) -> Option<Range<usize>> {
             else {
                 continue;
             };
-            if prefix.ends_with(char::is_whitespace) {
+            if prefix.is_empty() || prefix.ends_with(char::is_whitespace) {
                 let start = prefix.len() + quote.len();
                 return Some(start..start + name.len());
             }
@@ -172,6 +168,18 @@ fn filename_range_excludes_metadata_quotes_and_classification_markers() {
     let range = displayed_name_range(displayed, "some dir").unwrap();
     assert_eq!(&displayed[range], "some dir");
     assert!(displayed_name_range(displayed, "dir").is_none());
+}
+
+#[test]
+fn filename_range_accepts_bare_eza_output() {
+    for (displayed, name) in [
+        ("-folder", "-folder"),
+        ("some dir", "some dir"),
+        ("'some dir'", "some dir"),
+    ] {
+        let range = displayed_name_range(displayed, name).unwrap();
+        assert_eq!(&displayed[range], name);
+    }
 }
 
 fn copy_path(path: &Path, absolute: bool) -> io::Result<Option<String>> {
@@ -235,7 +243,7 @@ fn resize_listing(
 fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     let mut directory = std::env::current_dir()?;
-    let mut show_hidden = true;
+    let mut show_hidden = false;
     let mut sort_modified = false;
     let eza_args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut rows = load_rows(&directory, show_hidden, sort_modified, &eza_args)?;
